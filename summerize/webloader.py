@@ -1,4 +1,3 @@
-from langchain_openai import ChatOpenAI
 from langchain_community.document_loaders import WebBaseLoader
 from langchain.chains.summarize import load_summarize_chain
 from langchain.prompts import PromptTemplate
