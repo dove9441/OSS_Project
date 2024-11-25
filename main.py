@@ -10,15 +10,17 @@ import time
 import queue as q
 import threading
 import json
-from fastapi import Request, FastAPI
+from fastapi import Request, FastAPI, Response
+from langchain.chains import LLMChain
 dotenv.load_dotenv()
 
 ##### 기능 함수 구현 단계 #####
 # 메시지 전송
 def textResponseFormat(bot_response):
+    #print('------------BOT_RESONSE-------------')
+    #print(bot_response)
     response = {"version":"2.0", "template":{"outputs":[{"simpleText":{"text":bot_response}}], "quickReplies":[]}}
     return response
-
 
 # 사진 전송
 def imageResponseFormat(bot_response, prompt):
@@ -72,7 +74,7 @@ async def chat(request: Request):
 
 # 메인 함수
 def mainChat(kakaorequest):
-
+    #print(json.dumps(kakaorequest, indent=2))
     run_flag = False
     start_time = time.time()
     #kakaorequest = json.loads(event['body'])
@@ -103,17 +105,11 @@ def mainChat(kakaorequest):
     if run_flag == False:
         # 생각 끝남버튼 출력함수 호출
         response = timeover()
-
-    return{
-        'statusCode':200,
-        'body': json.dumps(response),
-        'headers': {
-            'Access-Control-Allow-Origin': '*',
-        }
-    }
+    return Response(content=json.dumps(response), media_type='application/json')
 
 # 답변/사진 요청 및 응답 확인 함수
 def responseOpenAI(request, response_queue, filename):
+    #print(json.dumps(request, indent=2))
     # 사용자가 버튼을 클릭하여 답변 완성 여부를 다시 봤을 시
     if '생각 다 끝났나요?' in request["userRequest"]["utterance"]:
         # 텍스트 파일 열기
@@ -128,11 +124,11 @@ def responseOpenAI(request, response_queue, filename):
                 response_queue.put(textResponseFormat(bot_res))
             dbReset(filename)
 
-    # ChatGPT 답변을 요청한 경우
-    elif '/ask' in request["userRequest"]["utterance"]:
+    # LLM 답변을 요청한 경우
+    elif '/ask' in request["userRequest"]["utterance"]: 
         dbReset(filename)
         prompt = request["userRequest"]["utterance"].replace("/ask", "")
-        bot_res = getTextFromLLAMA(prompt)
+        bot_res = getRagResponse_LLAMA(prompt)#getTextFromLLAMA(prompt)
         response_queue.put(textResponseFormat(bot_res))
 
         save_log = "ask" + " " + str(bot_res) + " " + str(prompt)
@@ -142,16 +138,32 @@ def responseOpenAI(request, response_queue, filename):
     # 아무 답변 요청이 없는 채팅일 경우
     else:
         # 기본 response 값
-        base_response = {'version':'2.0', 'template': {'outputs': [], 'quickReplies': []}}
-        response_queue.put(base_response)
+        defaultText = "아무 답변 요청이 없는 메시지입니다."
+        base_response = {
+                            "version": "2.0",
+                            "template": {
+                                "outputs": [
+                                {
+                                    "simpleText": {
+                                        "text": "default"
+                                    }
+                                }
+                                ]
+                            }
+                            }
+        response_queue.put(textResponseFormat(defaultText))
 
 
 
 
 def getTextFromLLAMA(prompt):
     llm = ChatGroq(model="llama-3.1-8b-instant")#llama-3.1-70b-versatile")
-    response = llm(prompt)
-    return response
+    combine_prompt = PromptTemplate(input_variables=['text'], template="You are an participatnt in 1:1 dialogue. Response about quesition. : {text}.")
+    chain = LLMChain(llm=llm, prompt=combine_prompt, verbose=True)
+    response = chain.invoke({'text':prompt})
+    return response['text']
+
+
 
 def getSummeryFromLLM(text):
     # 각 Chunk 단위의 템플릿
@@ -181,11 +193,79 @@ def getSummeryFromLLM(text):
     return summerized_msg
 
 
+################################# WEBSEARCH RAG TEST ######################
+import streamlit as st
+from langchain_community.document_loaders import AsyncChromiumLoader
+from langchain_community.document_transformers import BeautifulSoupTransformer
+from duckduckgo_search import DDGS
+import re
+
+# performs DuckDuckGo search, urls are extracted and status checked
+# 
+def ddg_search(query):
+    results = DDGS().text(query, max_results=5)
+    urls = []
+    for result in results:
+        url = result['href']
+        urls.append(url)
+
+    docs = get_page(urls)
+
+    content = []
+    for doc in docs:
+        page_text = re.sub("\n\n+", "\n", doc.page_content)
+        text = truncate(page_text)
+        content.append(text)
+
+    return content
+
+# retrieves pages and extracts text by tag
+def get_page(urls):
+    loader = AsyncChromiumLoader(urls)
+    html = loader.load()
+
+    bs_transformer = BeautifulSoupTransformer()
+    docs_transformed = bs_transformer.transform_documents(html, tags_to_extract=["p"], remove_unwanted_tags=["a"])
+
+    return docs_transformed
+
+# helper function to reduce the amount of text
+def truncate(text):
+    words = text.split()
+    truncated = " ".join(words[:400])
+
+    return truncated
+
+def getRagResponse_LLAMA(query):
+    search_results = ddg_search(query)
+    if not search_results:
+        return "No search results found or an error occurred."
+
+    # LLM initialization
+    llm = ChatGroq(model="llama-3.1-8b-instant")  # Ensure this model exists and is configured
+
+    # Prompt template
+    combine_prompt = PromptTemplate(
+        input_variables=['text', 'search_results'],
+        template="You are a participant in a 1:1 dialogue. Respond to the question using the search results. "
+                 "Question: {text}\n"
+                 "Search Results: {search_results}\n"
+                 "Answer:"
+    )
+
+    # Chain setup
+    chain = LLMChain(llm=llm, prompt=combine_prompt, verbose=True)
+    try:
+        response = chain.invoke({'text': query, 'search_results': "\n".join(search_results)})
+        return response['text']
+    except Exception as e:
+        print(f"Error during LLM invocation: {e}")
+        return "An error occurred while generating the response."
 
 
 
 
-text = """
+sampletext = """
 GOP senators could pay a price for a prolonged confirmation fight
 If Trump sticks with his pick, Republican senators feeling the MAGA movement’s pressure could be forced to defend Gaetz for weeks. That could land them in a tricky spot. Despite the threat that senators could face primaries if they break with the president-elect, votes for a compromised nominee could also haunt those seeking reelection in statewide races in 2026.
 
